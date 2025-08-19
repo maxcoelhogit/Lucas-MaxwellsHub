@@ -1,0 +1,14 @@
+{
+  "name": "lucas-whatsapp-webhook",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "openai": "^4.55.0",
+    "twilio": "^4.22.0"
+  }
+}
