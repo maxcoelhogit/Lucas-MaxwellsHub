@@ -1,4 +1,10 @@
 // api/whatsapp.js — Vercel Serverless (Twilio WhatsApp ↔ OpenAI Assistants v2)
+// Variáveis necessárias na Vercel:
+// OPENAI_API_KEY, OPENAI_ASSISTANT_ID
+// TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
+// TWILIO_WHATSAPP_NUMBER  (ex: whatsapp:+5512991322782)
+// ADMIN_WHATSAPP          (ex: whatsapp:+55SEU_NUMERO)  // opcional
+
 import { OpenAI } from 'openai';
 import twilio from 'twilio';
 import { StringDecoder } from 'string_decoder';
@@ -16,7 +22,7 @@ const {
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
-// Garante prefixo whatsapp:
+// Garante o prefixo whatsapp:
 const norm = v => (v?.startsWith('whatsapp:') ? v : `whatsapp:${v}`);
 
 // Lê x-www-form-urlencoded do Twilio
@@ -34,16 +40,9 @@ async function sendWhatsApp(to, body) {
   const from = norm(TWILIO_WHATSAPP_NUMBER);
   const toNorm = norm(to);
   console.log('Twilio send →', { from, to: toNorm, preview: (body || '').slice(0,160) });
-  try {
-    const msg = await twilioClient.messages.create({ from, to: toNorm, body });
-    console.log('Twilio OK, SID:', msg.sid);
-    return msg;
-  } catch (e) {
-    console.error('Twilio ERROR:', {
-      message: e.message, code: e.code, status: e.status, moreInfo: e.moreInfo
-    });
-    throw e;
-  }
+  const msg = await twilioClient.messages.create({ from, to: toNorm, body });
+  console.log('Twilio OK, SID:', msg.sid);
+  return msg;
 }
 
 function assertEnv() {
@@ -63,20 +62,18 @@ export default async function handler(req, res) {
   try {
     assertEnv();
 
-    // 1) Ler payload do Twilio e responder 200 imediatamente
-    const form = await readFormBody(req); // { From: 'whatsapp:+55...', Body: 'texto...' }
+    // 1) Ler payload do Twilio
+    const form = await readFormBody(req);            // { From: 'whatsapp:+55...', Body: 'texto...' }
     from = form.From;
     const text = (form.Body || '').trim();
     console.log('Inbound WhatsApp ←', { from, text });
-    res.status(200).send('');  // evita timeout do Twilio
 
-    if (!from || !text) return;
+    if (!from || !text) {
+      console.log('Sem "from" ou "text"; nada a fazer.');
+      return res.status(200).send('OK');
+    }
 
-    // 2) (opção de diagnóstico) — responda já um "eco" para validar o Twilio
-    // Descomente a linha abaixo para testar apenas o envio, sem OpenAI:
-    // return await sendWhatsApp(from, `Recebi: "${text}" ✅`);
-
-    // 3) Assistants v2 — criar thread, enviar msg, rodar e buscar resposta
+    // 2) Rodar o Assistants v2 (com deadline curto para ficar < ~12s)
     const thread = await openai.beta.threads.create(
       {}, { headers: { 'OpenAI-Beta': 'assistants=v2' } }
     );
@@ -93,7 +90,8 @@ export default async function handler(req, res) {
       { headers: { 'OpenAI-Beta': 'assistants=v2' } }
     );
 
-    const t0 = Date.now();
+    // Poll até 12s (Twilio costuma tolerar ~15s de webhook)
+    const deadline = Date.now() + 12000;
     while (true) {
       const r = await openai.beta.threads.runs.retrieve(
         thread.id, run.id, { headers: { 'OpenAI-Beta': 'assistants=v2' } }
@@ -103,32 +101,43 @@ export default async function handler(req, res) {
         console.error('Run status:', r.status, r.last_error);
         throw new Error(`Run status: ${r.status}`);
       }
-      if (Date.now() - t0 > 45000) throw new Error('OpenAI timeout');
-      await new Promise(r => setTimeout(r, 1100));
+      if (Date.now() > deadline) { throw new Error('OpenAI deadline (12s)'); }
+      await new Promise(r => setTimeout(r, 800));
     }
 
     const msgs = await openai.beta.threads.messages.list(
       thread.id,
       { order: 'desc', limit: 10, headers: { 'OpenAI-Beta': 'assistants=v2' } }
     );
-    const assistantMsg = msgs.data.find(m => m.role === 'assistant');
-    const answer = assistantMsg
-      ? assistantMsg.content.filter(c => c.type === 'text').map(c => c.text.value).join('\n').trim()
-      : 'Desculpe, não consegui responder agora. Pode tentar novamente?';
-    console.log('Assistant →', answer.slice(0,300));
 
-    // 4) Enviar resposta ao usuário
+    const assistantMsg = msgs.data.find(m => m.role === 'assistant');
+    const answer =
+      assistantMsg
+        ? assistantMsg.content.filter(c => c.type === 'text').map(c => c.text.value).join('\n').trim()
+        : 'Desculpe, não consegui responder agora. Pode tentar novamente?';
+
+    console.log('Assistant →', answer.slice(0, 300));
+
+    // 3) Enviar resposta ao usuário e SÓ DEPOIS finalizar a request
     await sendWhatsApp(from, answer);
 
-    // 5) Notificar admin se houver tag
+    // 4) (Opcional) Notificar admin se houver tag
     if (ADMIN_WHATSAPP && answer.includes('[NOTIFY_ADMIN]:')) {
       const note = answer.split('[NOTIFY_ADMIN]:')[1].trim().slice(0, 1000);
       await sendWhatsApp(ADMIN_WHATSAPP, `🔔 Notificação do Lucas:\n${note}`);
     }
+
+    return res.status(200).send('OK');
   } catch (e) {
-    console.error('Erro /api/whatsapp:', e);
+    console.error('Erro /api/whatsapp:', {
+      message: e.message, code: e.code, status: e.status, moreInfo: e.moreInfo
+    });
+
+    // Tenta resposta de fallback ao usuário
     try {
       if (from) await sendWhatsApp(from, 'Tive um problema técnico aqui 😕. Pode repetir a última mensagem?');
     } catch {}
+
+    return res.status(200).send('OK');
   }
 }
