@@ -1,5 +1,6 @@
-// api/whatsapp.js — Vercel Serverless (Twilio WhatsApp ↔ OpenAI Assistants v2)
-// + Forward para Google Apps Script (log de mensagens)
+// api/whatsapp.js — Vercel Serverless
+// Twilio WhatsApp ↔ OpenAI Assistants v2
+// + Log completo (inbound + outbound) no Google Sheets via Apps Script
 
 import { OpenAI } from 'openai';
 import twilio from 'twilio';
@@ -20,10 +21,12 @@ const {
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
-// Garante o prefixo whatsapp:
+// Garante prefixo whatsapp:
 const norm = v => (v?.startsWith('whatsapp:') ? v : `whatsapp:${v}`);
 
-// Lê x-www-form-urlencoded do Twilio
+// ===============================
+// Leitura do body (x-www-form-urlencoded)
+// ===============================
 function readFormBody(req) {
   return new Promise((resolve, reject) => {
     const decoder = new StringDecoder('utf8');
@@ -37,17 +40,42 @@ function readFormBody(req) {
   });
 }
 
+// ===============================
+// Envio WhatsApp via Twilio
+// + LOG outbound no Sheets
+// ===============================
 async function sendWhatsApp(to, body) {
   const from = norm(TWILIO_WHATSAPP_NUMBER);
   const toNorm = norm(to);
-  console.log('Twilio send →', { from, to: toNorm, preview: (body || '').slice(0,160) });
-  const msg = await twilioClient.messages.create({ from, to: toNorm, body });
+
+  console.log('Twilio send →', {
+    from,
+    to: toNorm,
+    preview: (body || '').slice(0, 160)
+  });
+
+  const msg = await twilioClient.messages.create({
+    from,
+    to: toNorm,
+    body
+  });
+
   console.log('Twilio OK, SID:', msg.sid);
+
+  // 👉 log da mensagem ENVIADA (outbound)
+  await logOutboundToSheets({
+    to: toNorm,
+    body,
+    messageSid: msg.sid
+  });
+
   return msg;
 }
 
-// 👉 FORWARD PARA GOOGLE SHEETS (Apps Script)
-async function forwardToSheets(form) {
+// ===============================
+// LOG inbound (payload original do Twilio)
+// ===============================
+async function forwardInboundToSheets(form) {
   if (!GOOGLE_APPS_SCRIPT_URL) return;
 
   try {
@@ -56,12 +84,42 @@ async function forwardToSheets(form) {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: querystring.stringify(form),
     });
-    console.log('Forward → Google Sheets OK');
+    console.log('Inbound → Google Sheets OK');
   } catch (err) {
-    console.error('Erro ao encaminhar para Sheets:', err.message);
+    console.error('Erro ao logar inbound:', err.message);
   }
 }
 
+// ===============================
+// LOG outbound (mensagem enviada pelo bot)
+// ===============================
+async function logOutboundToSheets({ to, body, messageSid }) {
+  if (!GOOGLE_APPS_SCRIPT_URL) return;
+
+  const payload = {
+    From: norm(TWILIO_WHATSAPP_NUMBER),
+    To: norm(to),
+    Body: body,
+    MessageSid: messageSid || `OUT-${Date.now()}`,
+    Direction: 'outbound-api',
+    Channel: 'whatsapp'
+  };
+
+  try {
+    await fetch(GOOGLE_APPS_SCRIPT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: querystring.stringify(payload),
+    });
+    console.log('Outbound → Google Sheets OK');
+  } catch (err) {
+    console.error('Erro ao logar outbound:', err.message);
+  }
+}
+
+// ===============================
+// Validação de variáveis
+// ===============================
 function assertEnv() {
   const miss = [];
   if (!OPENAI_API_KEY) miss.push('OPENAI_API_KEY');
@@ -72,29 +130,33 @@ function assertEnv() {
   if (miss.length) throw new Error(`Variáveis ausentes: ${miss.join(', ')}`);
 }
 
+// ===============================
+// HANDLER PRINCIPAL
+// ===============================
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(200).send('OK');
 
   let from = '';
+
   try {
     assertEnv();
 
     // 1) Ler payload do Twilio
-    const form = await readFormBody(req);   // { From, To, Body, MessageSid, ... }
+    const form = await readFormBody(req);
     from = form.From;
     const text = (form.Body || '').trim();
 
     console.log('Inbound WhatsApp ←', { from, text });
 
-    // 👉 1.1) Encaminha IMEDIATAMENTE para o Google Sheets (não bloqueante)
-    forwardToSheets(form);
+    // 1.1) Log IMEDIATO da mensagem recebida
+    forwardInboundToSheets(form);
 
     if (!from || !text) {
       console.log('Sem "from" ou "text"; nada a fazer.');
       return res.status(200).send('OK');
     }
 
-    // 2) Rodar o Assistants v2
+    // 2) Criar thread e rodar Assistants v2
     const thread = await openai.beta.threads.create(
       {}, { headers: { 'OpenAI-Beta': 'assistants=v2' } }
     );
@@ -115,10 +177,12 @@ export default async function handler(req, res) {
     const deadline = Date.now() + 12000;
     while (true) {
       const r = await openai.beta.threads.runs.retrieve(
-        thread.id, run.id, { headers: { 'OpenAI-Beta': 'assistants=v2' } }
+        thread.id,
+        run.id,
+        { headers: { 'OpenAI-Beta': 'assistants=v2' } }
       );
       if (r.status === 'completed') break;
-      if (['failed','expired','cancelled','incomplete'].includes(r.status)) {
+      if (['failed', 'expired', 'cancelled', 'incomplete'].includes(r.status)) {
         throw new Error(`Run status: ${r.status}`);
       }
       if (Date.now() > deadline) throw new Error('OpenAI deadline (12s)');
@@ -133,13 +197,16 @@ export default async function handler(req, res) {
     const assistantMsg = msgs.data.find(m => m.role === 'assistant');
     const answer =
       assistantMsg
-        ? assistantMsg.content.filter(c => c.type === 'text')
-            .map(c => c.text.value).join('\n').trim()
+        ? assistantMsg.content
+            .filter(c => c.type === 'text')
+            .map(c => c.text.value)
+            .join('\n')
+            .trim()
         : 'Desculpe, não consegui responder agora. Pode tentar novamente?';
 
     console.log('Assistant →', answer.slice(0, 300));
 
-    // 3) Enviar resposta ao usuário
+    // 3) Enviar resposta ao usuário (e logar outbound)
     await sendWhatsApp(from, answer);
 
     // 4) (Opcional) Notificar admin
@@ -155,7 +222,10 @@ export default async function handler(req, res) {
 
     try {
       if (from) {
-        await sendWhatsApp(from, 'Tive um problema técnico aqui 😕. Pode repetir a última mensagem?');
+        await sendWhatsApp(
+          from,
+          'Tive um problema técnico aqui 😕. Pode repetir a última mensagem?'
+        );
       }
     } catch {}
 
